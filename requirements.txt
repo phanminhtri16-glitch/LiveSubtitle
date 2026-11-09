@@ -1,0 +1,19 @@
+# Core Desktop UI
+PyQt6>=6.6.0
+
+# Local Speech-to-Text Engine
+faster-whisper>=1.0.0
+ctranslate2>=4.0.0
+
+# Windows Audio WASAPI Loopback Capture
+PyAudioWPatch>=0.2.12.6
+
+# Voice Activity Detection (VAD) & Neural Runtime
+onnxruntime>=1.16.0
+silero-vad>=5.1.0
+
+# Math & Signal Processing
+numpy>=1.24.0
+
+# Automated Testing
+pytest>=8.0.0
