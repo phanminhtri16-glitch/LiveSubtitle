@@ -33,7 +33,7 @@ htmlcov/
 
 # CodeGraph & superpowers scratch
 .codegraph/
-.superpowers/sdd/
+.superpowers/
 
 # Documentation
 docs/
