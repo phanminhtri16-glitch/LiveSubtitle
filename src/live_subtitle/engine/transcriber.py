@@ -1,13 +1,17 @@
+import os
 import re
 import numpy as np
 from faster_whisper import WhisperModel
 from src.live_subtitle.utils.logger import logger
 from src.live_subtitle.utils.system_info import detect_hardware
 
+DEFAULT_INITIAL_PROMPT = "Real-time live subtitles. Punctuated, clean, and accurate."
+
 class SpeechTranscriber:
     """
     Faster-Whisper local speech-to-text inference wrapper with automatic
-    hardware detection (CUDA float16 / CPU int8) and post-processing.
+    hardware detection (CUDA float16 / CPU int8), anti-hallucination streaming,
+    and prompt conditioning.
     """
 
     def __init__(
@@ -15,15 +19,22 @@ class SpeechTranscriber:
         model_size: str = "base",
         task: str = "transcribe",
         language: str | None = None,
+        initial_prompt: str | None = DEFAULT_INITIAL_PROMPT,
         load_model: bool = True,
     ):
         self.model_size = model_size
         self.task = task
         self.language = language if language != "auto" else None
+        self.initial_prompt = initial_prompt
         self._model: WhisperModel | None = None
 
         if load_model:
             self.load_model_instance(model_size)
+
+    def get_optimal_cpu_threads(self) -> int:
+        """Determines optimal CPU thread allocation for inference."""
+        cores = os.cpu_count() or 4
+        return min(8, max(1, cores))
 
     def auto_select_device(self) -> tuple[str, str]:
         """Detects hardware and returns (device, compute_type)."""
@@ -36,14 +47,18 @@ class SpeechTranscriber:
             self.model_size = model_size
 
         device, compute_type = self.auto_select_device()
-        logger.info(f"Loading Faster-Whisper model '{self.model_size}' on {device} ({compute_type})...")
+        cpu_threads = self.get_optimal_cpu_threads()
+        logger.info(
+            f"Loading Faster-Whisper model '{self.model_size}' on {device} "
+            f"({compute_type}) with {cpu_threads} threads..."
+        )
 
         try:
             self._model = WhisperModel(
                 self.model_size,
                 device=device,
                 compute_type=compute_type,
-                cpu_threads=4,
+                cpu_threads=cpu_threads,
             )
             logger.info(f"Faster-Whisper model '{self.model_size}' loaded successfully.")
         except Exception as e:
@@ -54,9 +69,9 @@ class SpeechTranscriber:
                     self.model_size,
                     device="cpu",
                     compute_type="int8",
-                    cpu_threads=4,
+                    cpu_threads=cpu_threads,
                 )
-                logger.info(f"Faster-Whisper model loaded on CPU fallback.")
+                logger.info("Faster-Whisper model loaded on CPU fallback.")
             else:
                 raise
 
@@ -70,6 +85,11 @@ class SpeechTranscriber:
         """Sets source language code or None for auto detection."""
         self.language = language if language and language != "auto" else None
         logger.info(f"Transcriber language set to: {self.language or 'auto-detect'}")
+
+    def set_initial_prompt(self, prompt: str | None) -> None:
+        """Sets initial context prompt for punctuation and vocabulary conditioning."""
+        self.initial_prompt = prompt
+        logger.info(f"Transcriber initial prompt updated: {prompt}")
 
     def clean_text(self, text: str) -> str:
         """Strips hallucinated sound tokens, timestamps, and redundant whitespace."""
@@ -89,8 +109,8 @@ class SpeechTranscriber:
 
     def transcribe_segment(self, audio_data: np.ndarray) -> str:
         """
-        Transcribes a 16kHz float32 audio segment.
-        Returns cleaned text string.
+        Transcribes a 16kHz float32 audio segment with streaming anti-hallucination
+        suppression and greedy decoding.
         """
         if len(audio_data) == 0:
             return ""
@@ -105,14 +125,23 @@ class SpeechTranscriber:
         audio_data = audio_data.astype(np.float32)
 
         try:
-            # beam_size=1 and vad_filter=False for ultra-low latency real-time streaming
+            # Low-latency streaming decoding options:
+            # - beam_size=1, best_of=1, temperature=0.0 for fastest inference
+            # - condition_on_previous_text=False prevents repetitive babble loops
+            # - compression_ratio_threshold=2.4 discards repetitive loops
+            # - initial_prompt primes punctuation and syntax
             segments, _ = self._model.transcribe(
                 audio_data,
                 language=self.language,
                 task=self.task,
                 beam_size=1,
-                vad_filter=False,
+                best_of=1,
                 temperature=0.0,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                initial_prompt=self.initial_prompt,
+                compression_ratio_threshold=2.4,
+                no_speech_threshold=0.6,
             )
 
             parts = [seg.text for seg in segments if seg.text]
