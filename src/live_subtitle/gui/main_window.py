@@ -21,6 +21,8 @@ from src.live_subtitle.engine.pipeline_worker import PipelineWorker
 from src.live_subtitle.gui.snip_tool import SnipTool
 from src.live_subtitle.gui.styles import MAIN_WINDOW_STYLE
 from src.live_subtitle.gui.subtitle_overlay import SubtitleOverlay
+from src.live_subtitle.gui.window_manager import WindowTracker, list_visible_windows
+from src.live_subtitle.gui.window_picker import WindowPicker
 from src.live_subtitle.utils.logger import logger
 from src.live_subtitle.utils.system_info import detect_hardware
 
@@ -42,6 +44,7 @@ LANGUAGES = [
 class MainWindow(QMainWindow):
     """
     Main controller dashboard for LiveSubtitle desktop application.
+    Supports dynamic window tab selection, continuous tracking, and low-latency local ASR.
     """
 
     def __init__(self, test_mode: bool = False, parent=None):
@@ -49,10 +52,18 @@ class MainWindow(QMainWindow):
         self.test_mode = test_mode
         self.settings = AppSettings()
         self.selected_frame: QRect | None = None
+        self.target_hwnd: int | None = None
+        self.target_title: str = ""
         self.is_active = False
 
         self.snip_tool: SnipTool | None = None
+        self.window_picker: WindowPicker | None = None
         self.overlay = SubtitleOverlay()
+
+        # Window tracker
+        self.tracker = WindowTracker(poll_interval_ms=100, parent=self)
+        self.tracker.geometry_changed.connect(self.on_tracked_geometry_changed)
+        self.tracker.visibility_changed.connect(self.on_tracked_visibility_changed)
 
         # Pipeline worker
         saved_model = self.settings.get_model()
@@ -68,10 +79,11 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._connect_signals()
+        self.refresh_window_list()
 
     def _init_ui(self) -> None:
         self.setWindowTitle("LiveSubtitle - Real-Time Local Captions")
-        self.resize(520, 680)
+        self.resize(540, 720)
         self.setStyleSheet(MAIN_WINDOW_STYLE)
 
         central = QWidget(self)
@@ -98,20 +110,46 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.hw_badge)
         root_layout.addLayout(header_layout)
 
-        # 2. Screen Frame Snip Section
-        frame_group = QGroupBox("Target Video Frame")
-        frame_layout = QVBoxLayout(frame_group)
+        # 2. Window / Target Frame Selection
+        target_group = QGroupBox("Target Window & Screen Selection")
+        target_layout = QVBoxLayout(target_group)
+        target_layout.setSpacing(10)
 
-        frame_top_layout = QHBoxLayout()
-        self.btn_select_frame = QPushButton("🎯 Select Video Frame")
+        # Dropdown selection + Refresh button
+        win_select_layout = QHBoxLayout()
+        self.combo_windows = QComboBox()
+        self.combo_windows.currentIndexChanged.connect(self._on_window_combo_changed)
+        win_select_layout.addWidget(self.combo_windows, stretch=1)
+
+        self.btn_refresh_windows = QPushButton("🔄 Refresh")
+        self.btn_refresh_windows.clicked.connect(self.refresh_window_list)
+        win_select_layout.addWidget(self.btn_refresh_windows)
+        target_layout.addLayout(win_select_layout)
+
+        # Action buttons row: Pick Window (crosshair) + Custom Snip
+        btn_row = QHBoxLayout()
+        self.btn_pick_window = QPushButton("🎯 Pick Window")
+        self.btn_pick_window.clicked.connect(self.launch_window_picker)
+        btn_row.addWidget(self.btn_pick_window)
+
+        self.btn_select_frame = QPushButton("📐 Custom Region")
         self.btn_select_frame.clicked.connect(self.launch_snip_tool)
-        frame_top_layout.addWidget(self.btn_select_frame)
+        btn_row.addWidget(self.btn_select_frame)
+        target_layout.addLayout(btn_row)
+
+        # Auto-track checkbox & Status
+        meta_row = QHBoxLayout()
+        self.chk_auto_track = QCheckBox("Auto-track Window Position & Size")
+        self.chk_auto_track.setChecked(True)
+        meta_row.addWidget(self.chk_auto_track)
 
         self.lbl_frame_info = QLabel("Fullscreen / Default")
         self.lbl_frame_info.setStyleSheet("color: #94a3b8; font-size: 12px;")
-        frame_top_layout.addWidget(self.lbl_frame_info)
-        frame_layout.addLayout(frame_top_layout)
-        root_layout.addWidget(frame_group)
+        meta_row.addStretch()
+        meta_row.addWidget(self.lbl_frame_info)
+        target_layout.addLayout(meta_row)
+
+        root_layout.addWidget(target_group)
 
         # 3. Primary Action & Live Audio Level
         action_group = QGroupBox("Live Transcription Control")
@@ -157,7 +195,6 @@ class MainWindow(QMainWindow):
         self.combo_language = QComboBox()
         for name, code in LANGUAGES:
             self.combo_language.addItem(name, code)
-        # Select current
         current_lang = self.settings.get_language()
         idx = max(0, self.combo_language.findData(current_lang))
         self.combo_language.setCurrentIndex(idx)
@@ -211,17 +248,70 @@ class MainWindow(QMainWindow):
         self.worker.error_occurred.connect(self.on_error_occurred)
         self.worker.audio_level.connect(self.on_audio_level)
 
+    def refresh_window_list(self) -> None:
+        """Refreshes active application windows in dropdown."""
+        self.combo_windows.blockSignals(True)
+        self.combo_windows.clear()
+        self.combo_windows.addItem("— Select Application Window —", None)
+
+        windows = list_visible_windows()
+        for win in windows:
+            title_display = win["title"]
+            if len(title_display) > 55:
+                title_display = title_display[:52] + "..."
+            self.combo_windows.addItem(f"{title_display}", win)
+
+        self.combo_windows.blockSignals(False)
+
+    def _on_window_combo_changed(self, index: int) -> None:
+        win_data = self.combo_windows.itemData(index)
+        if isinstance(win_data, dict):
+            self.on_window_selected(win_data["hwnd"], win_data["title"], win_data["rect"])
+
+    def launch_window_picker(self) -> None:
+        """Opens interactive window picker tool."""
+        self.window_picker = WindowPicker()
+        self.window_picker.window_selected.connect(self.on_window_selected)
+        self.window_picker.showFullScreen()
+
     def launch_snip_tool(self) -> None:
-        """Opens fullscreen frame selector."""
+        """Opens fullscreen custom region selector."""
         self.snip_tool = SnipTool()
         self.snip_tool.frame_selected.connect(self.on_frame_selected)
         self.snip_tool.showFullScreen()
 
-    def on_frame_selected(self, rect: QRect) -> None:
-        """Anchors overlay to the user's selected video frame."""
+    def on_window_selected(self, hwnd: int, title: str, rect: QRect) -> None:
+        """Callback when an application window is chosen."""
+        self.target_hwnd = hwnd
+        self.target_title = title
         self.selected_frame = rect
         self.lbl_frame_info.setText(f"{rect.width()} × {rect.height()} px")
         self.overlay.snap_to_rect(rect)
+
+        if self.chk_auto_track.isChecked() and self.is_active and not self.test_mode:
+            self.tracker.track_window(hwnd)
+
+    def on_frame_selected(self, rect: QRect) -> None:
+        """Anchors overlay to user's custom marquee frame."""
+        self.tracker.stop()
+        self.target_hwnd = None
+        self.target_title = "Custom Region"
+        self.selected_frame = rect
+        self.lbl_frame_info.setText(f"{rect.width()} × {rect.height()} px")
+        self.overlay.snap_to_rect(rect)
+
+    def on_tracked_geometry_changed(self, rect: QRect) -> None:
+        """Adjusts subtitle overlay when tracked window moves or resizes."""
+        self.selected_frame = rect
+        self.lbl_frame_info.setText(f"{rect.width()} × {rect.height()} px")
+        self.overlay.snap_to_rect(rect)
+
+    def on_tracked_visibility_changed(self, is_visible: bool) -> None:
+        """Hides overlay if target window is minimized, restores when active."""
+        if is_visible and self.is_active:
+            self.overlay.show()
+        else:
+            self.overlay.hide()
 
     def toggle_captions(self) -> None:
         """Starts or stops live captioning pipeline."""
@@ -234,11 +324,13 @@ class MainWindow(QMainWindow):
             if self.selected_frame is not None:
                 self.overlay.snap_to_rect(self.selected_frame)
             else:
-                # Default positioning
                 self.overlay.move(400, 600)
 
             self.overlay.update_subtitle("Listening for speech...")
             self.overlay.show()
+
+            if self.target_hwnd and self.chk_auto_track.isChecked() and not self.test_mode:
+                self.tracker.track_window(self.target_hwnd)
 
             self.worker.start_capture(test_mode=self.test_mode)
         else:
@@ -247,6 +339,7 @@ class MainWindow(QMainWindow):
             self.btn_toggle_captions.setObjectName("ActionBtnPrimary")
             self.btn_toggle_captions.setStyle(self.btn_toggle_captions.style())
 
+            self.tracker.stop()
             self.worker.stop_capture()
             self.overlay.hide()
             self.progress_audio.setValue(0)
@@ -302,6 +395,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean shutdown of background threads and overlays on window close."""
+        self.tracker.stop()
         self.worker.stop_capture()
         if self.worker.isRunning():
             self.worker.wait(2000)

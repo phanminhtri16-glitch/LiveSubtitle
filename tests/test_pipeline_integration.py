@@ -28,10 +28,13 @@ def test_pipeline_worker_lifecycle(qapp):
 
 def test_main_window_components(qapp):
     window = MainWindow(test_mode=True)
-    assert window.btn_select_frame is not None
     assert window.btn_toggle_captions is not None
     assert window.overlay is not None
     assert window.settings is not None
+    assert window.combo_windows is not None
+    assert window.btn_refresh_windows is not None
+    assert window.btn_pick_window is not None
+    assert window.chk_auto_track is not None
 
     # Test toggling captions
     assert not window.is_active
@@ -43,9 +46,33 @@ def test_main_window_components(qapp):
     assert not window.is_active
     assert not window.overlay.isVisible()
 
-def test_main_window_frame_selection(qapp):
+def test_main_window_window_selection_and_tracking(qapp):
     window = MainWindow(test_mode=True)
-    test_frame = QRect(200, 200, 600, 400)
-    window.on_frame_selected(test_frame)
-    assert window.selected_frame == test_frame
-    assert "600 × 400" in window.lbl_frame_info.text()
+    mock_hwnd = 12345
+    mock_title = "VLC media player"
+    mock_rect = QRect(200, 200, 900, 600)
+
+    # Trigger window selection
+    window.on_window_selected(mock_hwnd, mock_title, mock_rect)
+    assert window.target_hwnd == mock_hwnd
+    assert window.target_title == mock_title
+    assert window.overlay.geometry().y() > mock_rect.y()
+
+    # Activate captions so overlay is visible
+    window.toggle_captions()
+    assert window.overlay.isVisible()
+
+    # Simulate tracked window moved
+    new_rect = QRect(300, 350, 900, 600)
+    window.on_tracked_geometry_changed(new_rect)
+    assert window.overlay.geometry().x() >= new_rect.x()
+
+    # Simulate tracked window minimized
+    window.on_tracked_visibility_changed(False)
+    assert not window.overlay.isVisible()
+
+    # Simulate tracked window restored
+    window.on_tracked_visibility_changed(True)
+    assert window.overlay.isVisible()
+
+    window.toggle_captions()
