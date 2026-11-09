@@ -1,3 +1,4 @@
+from collections import deque
 import numpy as np
 import torch
 import silero_vad
@@ -7,7 +8,8 @@ class VadProcessor:
     """
     Real-time Voice Activity Detection and speech chunking engine using Silero VAD (ONNX).
     Segments streaming audio based on natural pauses (silence >= silence_ms) or
-    maximum speech duration (max_chunk_s).
+    maximum speech duration (max_chunk_s), with pre/post speech ring buffering
+    to prevent clipped phonemes.
     """
 
     def __init__(
@@ -16,7 +18,8 @@ class VadProcessor:
         silence_ms: int = 280,
         max_chunk_s: float = 2.0,
         threshold: float = 0.5,
-        min_speech_ms: int = 250,
+        min_speech_ms: int = 180,
+        pre_speech_ms: int = 160,
         use_energy_fallback: bool = True,
         energy_threshold: float = 0.015,
     ):
@@ -25,10 +28,14 @@ class VadProcessor:
         self.max_chunk_s = max_chunk_s
         self.threshold = threshold
         self.min_speech_ms = min_speech_ms
+        self.pre_speech_ms = pre_speech_ms
         self.use_energy_fallback = use_energy_fallback
         self.energy_threshold = energy_threshold
 
         self.window_size = 512  # 32ms at 16kHz
+        self.pre_speech_frames = max(1, int(round((self.pre_speech_ms / 1000.0) * self.sample_rate / self.window_size)))
+        self._pre_speech_ring = deque(maxlen=self.pre_speech_frames)
+
         self._incoming_buffer = np.array([], dtype=np.float32)
         self._speech_buffer: list[np.ndarray] = []
         self._silence_frames = 0
@@ -49,6 +56,7 @@ class VadProcessor:
     def reset(self) -> None:
         """Resets all internal audio buffers and VAD states."""
         self._incoming_buffer = np.array([], dtype=np.float32)
+        self._pre_speech_ring.clear()
         self._speech_buffer.clear()
         self._silence_frames = 0
         self._is_speaking = False
@@ -99,7 +107,12 @@ class VadProcessor:
                 is_speech = rms >= self.energy_threshold
 
             if is_speech:
-                self._is_speaking = True
+                if not self._is_speaking:
+                    self._is_speaking = True
+                    # Prepend pre-speech ring buffer frames to preserve initial phonemes
+                    self._speech_buffer.extend(self._pre_speech_ring)
+                    self._pre_speech_ring.clear()
+
                 self._silence_frames = 0
                 self._speech_buffer.append(frame)
 
@@ -125,7 +138,7 @@ class VadProcessor:
                         self._is_speaking = False
                         self._silence_frames = 0
                 else:
-                    # Ongoing silence; discard
-                    pass
+                    # Non-speech: accumulate in pre-speech ring buffer
+                    self._pre_speech_ring.append(frame)
 
         return segments
